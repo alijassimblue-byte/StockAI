@@ -1,0 +1,6 @@
+streamlit>=1.39
+yfinance>=0.2.40
+pandas>=2.2
+numpy>=1.26
+scikit-learn>=1.5
+plotly>=5.24
