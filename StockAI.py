@@ -28,6 +28,13 @@ MIN_ROWS = 350
 SRC_YAHOO = "Yahoo Finance (live download)"
 SRC_CSV = "Uploaded prices.csv"
 
+SPEED_FAST = "Fast (recommended)"
+SPEED_STANDARD = "Standard (slower, more thorough)"
+SPEED_PARAMS = {
+    SPEED_FAST: dict(max_iter=80, learning_rate=0.10, max_leaf_nodes=12, bt_iter=60, bt_lr=0.10),
+    SPEED_STANDARD: dict(max_iter=250, learning_rate=0.045, max_leaf_nodes=15, bt_iter=180, bt_lr=0.05),
+}
+
 PAGES = [
     "🏠 Dashboard", "🔍 Stock Screener", "🤖 AI Predictions", "📊 Stock Analysis",
     "🧪 Backtesting", "⭐ Watchlist", "💼 Portfolio", "🗄️ Data Center",
@@ -301,7 +308,8 @@ def make_features(df, market_close):
     return f.replace([np.inf, -np.inf], np.nan)
 
 
-def train_models(df, market_close):
+def train_models(df, market_close, speed=SPEED_FAST):
+    sp = SPEED_PARAMS[speed]
     features = make_features(df, market_close)
     models, diagnostics = {}, {}
     Xcols = list(features.columns)
@@ -317,8 +325,8 @@ def train_models(df, market_close):
         split = int(len(data) * 0.8)
         train, test = data.iloc[:max(split - h, 1)], data.iloc[split:]
         model = HistGradientBoostingRegressor(
-            max_iter=250, learning_rate=0.045, max_leaf_nodes=15,
-            l2_regularization=1.0, random_state=42
+            max_iter=sp["max_iter"], learning_rate=sp["learning_rate"],
+            max_leaf_nodes=sp["max_leaf_nodes"], l2_regularization=1.0, random_state=42
         )
         model.fit(train[Xcols], train["target"])
         pred = model.predict(test[Xcols])
@@ -334,8 +342,8 @@ def train_models(df, market_close):
     return features, models, diagnostics
 
 
-def score_stock(df, market_close):
-    features, models, diagnostics = train_models(df, market_close)
+def score_stock(df, market_close, speed=SPEED_FAST):
+    features, models, diagnostics = train_models(df, market_close, speed)
     valid = features.dropna()
     if valid.empty or not models:
         return None
@@ -369,9 +377,10 @@ def score_stock(df, market_close):
     }
 
 
-def backtest(df, market_close, horizon=20, cost=0.001, threshold=0.02):
+def backtest(df, market_close, horizon=20, cost=0.001, threshold=0.02, speed=SPEED_FAST):
     """Walk-forward, non-overlapping trades, purge gap before each test block,
     and a per-trade cost."""
+    sp = SPEED_PARAMS[speed]
     features = make_features(df, market_close)
     y = df["Close"].shift(-horizon) / df["Close"] - 1
     data = features.join(y.rename("target")).dropna()
@@ -389,7 +398,7 @@ def backtest(df, market_close, horizon=20, cost=0.001, threshold=0.02):
             continue
         test = data.iloc[i:min(i + step, len(data) - horizon)]
         model = HistGradientBoostingRegressor(
-            max_iter=180, learning_rate=0.05, max_leaf_nodes=12,
+            max_iter=sp["bt_iter"], learning_rate=sp["bt_lr"], max_leaf_nodes=12,
             l2_regularization=1.0, random_state=42
         )
         model.fit(train[Xcols], train["target"])
@@ -426,6 +435,8 @@ def backtest(df, market_close, horizon=20, cost=0.001, threshold=0.02):
 def run_analysis():
     source = st.session_state.get("data_source", SRC_YAHOO)
     window = st.session_state.get("window", "5y")
+    speed = st.session_state.get("speed", SPEED_FAST)
+    max_stocks = int(st.session_state.get("max_stocks", 40))
     years = {"2y": 2, "5y": 5, "10y": 10, "All": None}[window]
 
     if source == SRC_CSV:
@@ -435,12 +446,14 @@ def run_analysis():
             return False
         ver = st.session_state.get("csv_version", 0)
         chosen = st.session_state.get(f"csv_universe_{ver}") or [t for t in csv if t not in BENCHMARKS]
+        chosen = chosen[:max_stocks]
         prices = {t: trim(csv[t], years) for t in chosen if t in csv}
     else:
         tickers = [x.strip().upper() for x in st.session_state.get("tickers_text", ",".join(DEFAULT_TICKERS)).split(",") if x.strip()]
         if not tickers:
             st.warning("Enter at least one ticker in the sidebar.")
             return False
+        tickers = tickers[:max_stocks]
         with st.spinner("Downloading market history from Yahoo Finance..."):
             prices = download_prices(tickers, "max" if years is None else window)
 
@@ -453,12 +466,22 @@ def run_analysis():
         st.error("SPY market benchmark data is unavailable.")
         return False
 
+    cache = st.session_state.setdefault("score_cache", {})
+    mkey = str(market_close.index[-1]) if len(market_close) else ""
+
     rows, details = [], {}
     progress = st.progress(0, text="Training models...")
+    total = max(len(prices), 1)
     for n, (ticker, df) in enumerate(prices.items(), 1):
         try:
             if len(df) >= MIN_ROWS:
-                result = score_stock(df, market_close)
+                key = (ticker, len(df), str(df.index[-1]), speed, window, source, mkey)
+                result = cache.get(key)
+                if result is None:
+                    progress.progress((n - 1) / total, text=f"Training {ticker}... ({n}/{total})")
+                    result = score_stock(df, market_close, speed)
+                    if result:
+                        cache[key] = result
                 if result:
                     bh = result["best_horizon"]
                     rows.append({
@@ -474,7 +497,7 @@ def run_analysis():
                     details[ticker] = result
         except Exception:
             pass
-        progress.progress(n / max(len(prices), 1), text=f"Training models... {n}/{len(prices)}")
+        progress.progress(n / total, text=f"Done {n}/{total}")
     progress.empty()
 
     if not rows:
@@ -487,7 +510,7 @@ def run_analysis():
     st.session_state["analysis"] = {
         "ranking": ranking, "details": details, "prices": prices,
         "market_close": market_close, "source": source, "window": window,
-        "ran_at": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M"),
+        "speed": speed, "ran_at": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M"),
     }
     return True
 
@@ -536,7 +559,12 @@ with st.sidebar:
     else:
         st.text_area("Tickers (comma-separated)", ",".join(DEFAULT_TICKERS), height=130, key="tickers_text")
     st.selectbox("Historical training window", ["2y", "5y", "10y", "All"], index=1, key="window")
+    st.selectbox("Speed", [SPEED_FAST, SPEED_STANDARD], key="speed",
+                 help="Fast uses lighter models and finishes several times quicker.")
+    st.number_input("Max stocks to analyze", min_value=5, max_value=500, value=40, step=5, key="max_stocks",
+                    help="Only the first N tickers are analyzed. Raise it once you know how fast it runs.")
     run_clicked = st.button("🔄 Analyze market", use_container_width=True)
+    st.caption("Finished stocks are remembered, so re-running skips them.")
 
 apply_theme(st.session_state["theme"])
 
@@ -704,7 +732,7 @@ elif page == "🧪 Backtesting":
 
     if st.button("▶️ Run backtest"):
         with st.spinner("Running walk-forward backtest..."):
-            bt = backtest(prices[tk], market_close, bt_h, cost, thr)
+            bt = backtest(prices[tk], market_close, bt_h, cost, thr, st.session_state.get("speed", SPEED_FAST))
         if bt:
             x, y, z, w = st.columns(4)
             x.metric("Strategy return", f"{bt['strategy_return'] * 100:.1f}%")
@@ -865,8 +893,8 @@ elif page == "🗄️ Data Center":
     st.subheader("Current analysis")
     A = st.session_state.get("analysis")
     if A:
-        st.write(f"Source: **{A['source']}** • Window: **{A['window']}** • Stocks scored: "
-                 f"**{len(A['ranking'])}** • Last run: **{A['ran_at']}**")
+        st.write(f"Source: **{A['source']}** • Window: **{A['window']}** • Speed: **{A.get('speed', '')}** • "
+                 f"Stocks scored: **{len(A['ranking'])}** • Last run: **{A['ran_at']}**")
     else:
         st.write("Nothing analyzed yet. Click **🔄 Analyze market** in the sidebar.")
 
@@ -906,7 +934,10 @@ elif page == "🧠 Model Lab":
 6. **Risk adjustment:** forecasts are divided by recent volatility so the largest raw forecast doesn't automatically win.
 7. **Time-ordered testing:** training data always comes before test data, with a gap so targets never overlap.
     """)
-    st.markdown("**Model:** HistGradientBoostingRegressor (250 iterations, learning rate 0.045, 15 leaves, L2 = 1.0)")
+    sp = SPEED_PARAMS[A.get("speed", SPEED_FAST)]
+    st.markdown(f"**Model:** HistGradientBoostingRegressor ({sp['max_iter']} iterations, "
+                f"learning rate {sp['learning_rate']}, {sp['max_leaf_nodes']} leaves, L2 = 1.0) • "
+                f"Speed mode: {A.get('speed', SPEED_FAST)}")
 
 elif page == "⚙️ Settings":
     st.title("⚙️ Settings")
@@ -926,13 +957,16 @@ elif page == "⚙️ Settings":
     st.caption("Tables use Streamlit's own colors. To restyle those too, use the ⋮ menu → Settings → Theme.")
 
     st.subheader("Maintenance")
-    m1, m2 = st.columns(2)
+    m1, m2, m3 = st.columns(3)
     if m1.button("♻️ Clear cached downloads"):
         st.cache_data.clear()
         st.success("Cache cleared.")
     if m2.button("🧹 Reset analysis results"):
         st.session_state.pop("analysis", None)
         st.success("Analysis cleared. It will re-run when you open a page that needs it.")
+    if m3.button("🗑️ Clear trained-model cache"):
+        st.session_state.pop("score_cache", None)
+        st.success("Trained results cleared. The next analysis will retrain every stock.")
 
     st.subheader("About")
     st.info(DISCLAIMER)
